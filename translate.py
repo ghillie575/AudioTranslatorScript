@@ -33,7 +33,7 @@ except ImportError:
     # Updated installation instruction
     print("❌ Please install Coqui TTS and pydub: pip install TTS[pytorch] pydub")
     exit(1)
-# Load settings
+
 from settings import *
 
 
@@ -390,80 +390,93 @@ class LocalAudioTranslator:
         
     def synthesize_tts_from_segments(self, translated_segments, audio_duration, out_filename=None):
         """
-        Generate a single TTS WAV directly from translated segments (JSON data) with progress.
-        This function replaces the old subtitle-based generation.
+        Generate a single TTS WAV from translated segments (JSON data) with exact duration alignment.
+        Each segment fits exactly between its 'start' and 'end' timestamps.
         """
         self.log("Step 5: Generating single-file Polish TTS from translated segments...")
-        
+    
         if out_filename is None:
             out_filename = self.dirs["tts"] / f"tts_polish_{self.timestamp}.wav"
         else:
             out_filename = Path(out_filename)
         self.final_tts_file = out_filename
-        
-        self.load_tts_model() # Load TTS model (model string is now fixed)
 
+        self.load_tts_model()  # Load Coqui TTS model
+    
         if not translated_segments:
             raise RuntimeError("No translated segments found for TTS generation.")
 
         tmpdir = Path(tempfile.mkdtemp(prefix="tts_tmp_"))
-        tmp_files = [] # Stores (start_sec, tmp_wav_path)
-        
+        tmp_files = []  # Stores (start_sec, tmp_wav_path, target_duration)
+
         total_segments = len(translated_segments)
 
         try:
-            # Progress bar for segment generation
+            # --- Step 1: Generate TTS for each segment ---
             with tqdm(total=total_segments, desc="🎵 Generating Audio Segments", unit="seg",
-                      bar_format='{desc}: {percentage:3.0f}%|{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}]') as pbar:
+                  bar_format='{desc}: {percentage:3.0f}%|{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}]') as pbar:
 
                 for i, seg in enumerate(translated_segments):
                     text = seg.get('translated', '').strip()
                     start_sec = seg.get('start', 0.0)
-                    
+                    end_sec = seg.get('end', start_sec + 1.0)  # fallback 1s if missing
+                    target_duration = end_sec - start_sec
+
                     if not text:
                         pbar.update(1)
                         continue
-                        
+
                     tmp_wav = tmpdir / f"sub_{i:04d}.wav"
-                    
-                    # Generate TTS audio for the segment
+
+                    # Generate TTS for segment
                     self.tts_engine.tts_to_file(
-                        text=text, 
+                        text=text,
                         file_path=str(tmp_wav),
-                        speaker_wav=COQUI_TTS_SPEAKER, # <--- CRITICAL: MUST BE VALID PATH
+                        speaker_wav=COQUI_TTS_SPEAKER,  # MUST be valid
                         language=self._language_code_from_name(self.target_language)
                     )
-                    
-                    tmp_files.append((start_sec, str(tmp_wav)))
+
+                    tmp_files.append((start_sec, str(tmp_wav), target_duration))
                     pbar.update(1)
 
-            # Concatenate audio segments, adding silence/gaps
-            self.log("   └─ Concatenating audio segments...")
+        # --- Step 2: Concatenate segments with exact timing ---
+            self.log("   └─ Concatenating audio segments with exact timing...")
             tmp_files.sort(key=lambda x: x[0])
-            final_audio = AudioSegment.silent(duration=0) # Start with empty audio
+            final_audio = AudioSegment.silent(duration=0)  # start empty
             current_time_ms = 0
 
-            for start_sec, wav_path in tmp_files:
-                start_ms = int(round(float(start_sec) * 1000))
+            for start_sec, wav_path, target_duration in tmp_files:
+                start_ms = int(round(start_sec * 1000))
                 seg_audio = AudioSegment.from_file(wav_path)
-                seg_duration_ms = len(seg_audio)
+                tts_duration = len(seg_audio) / 1000.0  # seconds
 
-                # Add silence gap
+                # Adjust segment to fit exact duration
+                if tts_duration > target_duration:
+                    # speed up to fit
+                    speed_factor = tts_duration / target_duration
+                    seg_audio = effects.speedup(seg_audio, playback_speed=speed_factor)
+                    seg_audio = seg_audio[:int(target_duration * 1000)]  # trim if slightly overshoot
+                elif tts_duration < target_duration:
+                    # pad with silence
+                    pad_ms = int(round((target_duration - tts_duration) * 1000))
+                    seg_audio += AudioSegment.silent(duration=pad_ms)
+
+                # Add silence before segment if needed
                 if start_ms > current_time_ms:
                     gap_ms = start_ms - current_time_ms
                     final_audio += AudioSegment.silent(duration=gap_ms)
                     current_time_ms += gap_ms
-                
-                # Append translated segment audio
+
+                # Append segment
                 final_audio += seg_audio
-                current_time_ms += seg_duration_ms
+                current_time_ms += int(target_duration * 1000)
 
-            # Add trailing silence if the final audio is shorter than the original
+        # --- Step 3: Add trailing silence if needed ---
             if audio_duration > 0 and current_time_ms < audio_duration * 1000:
-                 trailing_gap_ms = int(round(audio_duration * 1000 - current_time_ms))
-                 final_audio += AudioSegment.silent(duration=trailing_gap_ms)
+                trailing_ms = int(round(audio_duration * 1000 - current_time_ms))
+                final_audio += AudioSegment.silent(duration=trailing_ms)
 
-
+            # Export final WAV
             final_audio.export(str(out_filename), format="wav")
             self.log(f"Single TTS WAV saved to: {out_filename}")
             return out_filename
@@ -474,6 +487,7 @@ class LocalAudioTranslator:
                 shutil.rmtree(tmpdir)
             except Exception:
                 pass
+
 
 
     def translate_with_google(self, text, target_lang):
