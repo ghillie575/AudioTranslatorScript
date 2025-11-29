@@ -8,6 +8,8 @@ Google Translate (public endpoint) when Ollama fails.
 - Ollama (local) for translation (preferred)
 - Fallback to translate.googleapis.com when Ollama fails
 - Coqui TTS (local) for generating translated audio
+- **Feature added: Extract audio from VIDEO_FILE**
+- **Feature added: Final outputs copied to a separate directory**
 
 All processing done on your machine (except optional Google fallback).
 """
@@ -19,22 +21,46 @@ import traceback
 from pathlib import Path
 from datetime import datetime, timedelta
 import requests
+from transformers import AutoTokenizer, AutoModelForCausalLM
 import torch
 from faster_whisper import WhisperModel
 from tqdm import tqdm
 import math
-import tempfile # Added for temporary file management in TTS
-import shutil   # Added for temporary directory cleanup in TTS
+import tempfile
+import shutil
 from urllib.parse import quote_plus
 try:
     from TTS.api import TTS
-    from pydub import AudioSegment # Added for audio concatenation and silence
+    from pydub import AudioSegment
+    from pydub import effects
 except ImportError:
     # Updated installation instruction
     print("❌ Please install Coqui TTS and pydub: pip install TTS[pytorch] pydub")
     exit(1)
 
-from settings import *
+#Settings
+# --- Input/Output ---
+INPUT_AUDIO = "audio.wav"         # Path to input audio file
+OUTPUT_DIR = "translation_output" # Directory to store outputs
+LANGUAGE = "Polish"               # Target language for translation
+VIDEO_FILE = "video.mp4"
+# --- Whisper Model Settings ---
+WHISPER_MODEL = "large-v3"                 # Options: tiny, base, small, medium, large-v2, large-v3
+WHISPER_DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+WHISPER_COMPUTE_TYPE = "float16" if torch.cuda.is_available() else "int8"
+
+# --- Coqui TTS Settings ---
+COQUI_TTS_MODEL = "tts_models/multilingual/multi-dataset/xtts_v2"
+COQUI_TTS_SPEAKER = "sample.wav"  # Path to speaker sample audio
+
+# --- Ollama Settings ---
+OLLAMA_MODEL = "llama3.1:8b"  # or llama3.1:70b
+OLLAMA_URL = "http://localhost:11434/api/generate"
+OLLAMA_TAGS_URL = "http://localhost:11434/api/tags"
+
+# --- Google Translate Fallback ---
+USE_GOOGLE_FALLBACK = True
+GOOGLE_TRANSLATE_ENDPOINT = "https://translate.googleapis.com/translate_a/single"
 
 
 class LocalAudioTranslator:
@@ -43,7 +69,8 @@ class LocalAudioTranslator:
         self.output_dir = Path(output_dir)
         self.target_language = target_language
         self.timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-
+        self.llama_model = None
+        self.llama_tokenizer = None
         # Create output directory structure
         self.dirs = {
             "root": self.output_dir,
@@ -51,9 +78,10 @@ class LocalAudioTranslator:
             "transcripts": self.output_dir / "transcripts",
             "translations": self.output_dir / "translations",
             "subtitles": self.output_dir / "subtitles",
-            "tts": self.output_dir / "tts_output", # Added TTS output directory
+            "tts": self.output_dir / "tts_output",
             "logs": self.output_dir / "logs",
-            "models": self.output_dir / "models_cache"
+            "models": self.output_dir / "models_cache",
+            "final_output": self.output_dir / "final_translated_files" # ADDED final output dir
         }
 
         for dir_path in self.dirs.values():
@@ -65,16 +93,16 @@ class LocalAudioTranslator:
 
         # Initialize Whisper and TTS model placeholders
         self.whisper_model = None
-        self.tts_engine = None # Added TTS engine placeholder
+        self.tts_engine = None
 
-        # Paths for report generation
+        # Paths for report generation and final outputs
         self.audio_file_path = None
         self.transcript_file_path = None
         self.translation_file_path = None
         self.srt_file_path = None
         self.vtt_file_path = None
         self.bilingual_file_path = None
-        self.final_tts_file = None # Added path for final TTS file
+        self.final_tts_file = None
         self.report_file_path = None
 
         # Check for existing files from previous runs
@@ -171,13 +199,13 @@ class LocalAudioTranslator:
             except Exception as e:
                 self.log(f"Error loading Whisper: {e}")
                 raise
-                
+
     def load_tts_model(self):
         """Load Coqui TTS model locally"""
         if self.tts_engine is None:
             self.log(f"Loading Coqui TTS model: {COQUI_TTS_MODEL}")
             try:
-                # Load the TTS engine. The model name has been updated to fix the KeyError.
+                # Load the TTS engine.
                 self.tts_engine = TTS(COQUI_TTS_MODEL, gpu=torch.cuda.is_available())
                 self.log("Coqui TTS model loaded successfully")
             except Exception as e:
@@ -189,7 +217,7 @@ class LocalAudioTranslator:
         self.log("Step 1: Extracting/converting audio...")
 
         if self.existing_files["audio"] and self.existing_files["audio"].exists():
-            self.log(f"⏭️  Using existing audio file: {self.existing_files['audio']}")
+            self.log(f"⏭️  Using existing audio file: {self.existing_files['audio']}")
             self.audio_file_path = self.existing_files['audio']
             return self.audio_file_path
 
@@ -239,31 +267,11 @@ class LocalAudioTranslator:
                 cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True, bufsize=1
             )
 
-            with tqdm(total=int(duration) if duration > 0 else None,
-                      desc="🔊 Extracting Audio", unit="s",
-                      bar_format='{desc}: {percentage:3.0f}%|{bar}| {n:.1f}/{total:.1f}s [{elapsed}<{remaining}]') as pbar:
-
-                last_time = 0.0
-                for line in process.stdout:
-                    line = line.strip()
-                    if not line:
-                        continue
-                    # ffmpeg -progress prints lines like key=value
-                    if "=" in line:
-                        key, val = line.split("=", 1)
-                        if key == "out_time_ms":
-                            try:
-                                t_sec = int(val) / 1_000_000.0
-                                if duration > 0:
-                                    to_add = max(0.0, t_sec - last_time)
-                                    pbar.update(to_add)
-                                last_time = t_sec
-                            except:
-                                pass
-                        elif key == "progress" and val == "end":
-                            # finish
-                            if duration > 0:
-                                pbar.update(max(0, int(duration) - int(last_time)))
+            # Use simpler bar_format that handles None values better
+            if duration > 0:
+                bar_format = '{desc}: {percentage:3.0f}%|{bar}| {n:.1f}/{total:.1f}s [{elapsed}<{remaining}]'
+            else:
+                bar_format = '{desc}: |{bar}| {n:.1f}s [{elapsed}]'
                 process.wait()
                 stderr_output = process.stderr.read()
 
@@ -288,7 +296,7 @@ class LocalAudioTranslator:
 
         self.transcript_file_path = self.dirs["transcripts"] / f"transcript_raw_{self.timestamp}.json"
         if self.existing_files["transcript"] and self.existing_files["transcript"].exists():
-            self.log(f"⏭️  Using existing transcript: {self.existing_files['transcript']}")
+            self.log(f"⏭️  Using existing transcript: {self.existing_files['transcript']}")
             with open(self.existing_files["transcript"], "r", encoding="utf-8") as f:
                 return json.load(f)
 
@@ -325,7 +333,7 @@ class LocalAudioTranslator:
         last_end_time = 0.0
 
         with tqdm(total=int(total_duration) if total_duration > 0 else None,
-                  desc="🎙️  Transcribing Audio", unit="s",
+                  desc="🎙️  Transcribing Audio", unit="s",
                   bar_format='{desc}: {percentage:3.0f}%|{bar}| {n:.1f}/{total:.1f}s [{elapsed}<{remaining}]') as pbar:
 
             for i, segment in enumerate(segments_generator):
@@ -387,39 +395,41 @@ class LocalAudioTranslator:
 
         self.log(f"Text transcript saved to: {text_file}")
         return transcript_data
-        
+
     def synthesize_tts_from_segments(self, translated_segments, audio_duration, out_filename=None):
         """
-        Generate a single TTS WAV from translated segments (JSON data) with exact duration alignment.
-        Each segment fits exactly between its 'start' and 'end' timestamps.
+        Generate TTS with natural voice quality.
+        Since translations are now duration-optimized, we can use natural timing.
         """
         self.log("Step 5: Generating single-file Polish TTS from translated segments...")
-    
+
         if out_filename is None:
             out_filename = self.dirs["tts"] / f"tts_polish_{self.timestamp}.wav"
         else:
             out_filename = Path(out_filename)
         self.final_tts_file = out_filename
 
-        self.load_tts_model()  # Load Coqui TTS model
-    
+        self.load_tts_model()
+
         if not translated_segments:
             raise RuntimeError("No translated segments found for TTS generation.")
 
         tmpdir = Path(tempfile.mkdtemp(prefix="tts_tmp_"))
-        tmp_files = []  # Stores (start_sec, tmp_wav_path, target_duration)
-
+    
         total_segments = len(translated_segments)
 
         try:
-            # --- Step 1: Generate TTS for each segment ---
+            # --- Step 1: Generate TTS and analyze fit ---
             with tqdm(total=total_segments, desc="🎵 Generating Audio Segments", unit="seg",
-                  bar_format='{desc}: {percentage:3.0f}%|{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}]') as pbar:
+                bar_format='{desc}: {percentage:3.0f}%|{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}]') as pbar:
 
+                segment_data = []
+                fit_issues = 0
+            
                 for i, seg in enumerate(translated_segments):
                     text = seg.get('translated', '').strip()
                     start_sec = seg.get('start', 0.0)
-                    end_sec = seg.get('end', start_sec + 1.0)  # fallback 1s if missing
+                    end_sec = seg.get('end', start_sec + 1.0)
                     target_duration = end_sec - start_sec
 
                     if not text:
@@ -428,57 +438,65 @@ class LocalAudioTranslator:
 
                     tmp_wav = tmpdir / f"sub_{i:04d}.wav"
 
-                    # Generate TTS for segment
+                    # Generate TTS
                     self.tts_engine.tts_to_file(
                         text=text,
                         file_path=str(tmp_wav),
-                        speaker_wav=COQUI_TTS_SPEAKER,  # MUST be valid
+                        speaker_wav=COQUI_TTS_SPEAKER,
                         language=self._language_code_from_name(self.target_language)
                     )
 
-                    tmp_files.append((start_sec, str(tmp_wav), target_duration))
+                    # Check fit
+                    seg_audio = AudioSegment.from_file(tmp_wav)
+                    actual_duration = len(seg_audio) / 1000.0
+                    duration_ratio = actual_duration / target_duration
+                
+                    if duration_ratio > 1.15:  # More than 15% over
+                        fit_issues += 1
+                        self.log(f"   ⚠ Segment {i+1}: TTS {actual_duration:.2f}s vs target {target_duration:.2f}s")
+                        self.log(f"      Text: '{text[:60]}...'")
+
+                    segment_data.append({
+                        'start': start_sec,
+                        'path': str(tmp_wav),
+                        'actual_duration': actual_duration,
+                        'target_duration': target_duration,
+                        'fit_ratio': duration_ratio
+                    })
+
                     pbar.update(1)
 
-        # --- Step 2: Concatenate segments with exact timing ---
-            self.log("   └─ Concatenating audio segments with exact timing...")
-            tmp_files.sort(key=lambda x: x[0])
-            final_audio = AudioSegment.silent(duration=0)  # start empty
+            if fit_issues > 0:
+                self.log(f"   ⚠ {fit_issues}/{total_segments} segments don't fit well - consider re-translating with stricter constraints")
+
+            # --- Step 2: Concatenate with natural timing (no speed changes) ---
+            self.log("   └─ Concatenating audio segments with natural timing...")
+            final_audio = AudioSegment.silent(duration=0)
             current_time_ms = 0
 
-            for start_sec, wav_path, target_duration in tmp_files:
-                start_ms = int(round(start_sec * 1000))
-                seg_audio = AudioSegment.from_file(wav_path)
-                tts_duration = len(seg_audio) / 1000.0  # seconds
+            for seg_info in segment_data:
+                start_ms = int(round(seg_info['start'] * 1000))
+                seg_audio = AudioSegment.from_file(seg_info['path'])
 
-                # Adjust segment to fit exact duration
-                if tts_duration > target_duration:
-                    # speed up to fit
-                    speed_factor = tts_duration / target_duration
-                    seg_audio = effects.speedup(seg_audio, playback_speed=speed_factor)
-                    seg_audio = seg_audio[:int(target_duration * 1000)]  # trim if slightly overshoot
-                elif tts_duration < target_duration:
-                    # pad with silence
-                    pad_ms = int(round((target_duration - tts_duration) * 1000))
-                    seg_audio += AudioSegment.silent(duration=pad_ms)
-
-                # Add silence before segment if needed
+                # Add silence to reach start time
                 if start_ms > current_time_ms:
                     gap_ms = start_ms - current_time_ms
                     final_audio += AudioSegment.silent(duration=gap_ms)
-                    current_time_ms += gap_ms
+                    current_time_ms = start_ms
 
-                # Append segment
+                # Append segment at natural length (NO speed modification)
                 final_audio += seg_audio
-                current_time_ms += int(target_duration * 1000)
+                current_time_ms += len(seg_audio)
 
-        # --- Step 3: Add trailing silence if needed ---
+            # Add trailing silence
             if audio_duration > 0 and current_time_ms < audio_duration * 1000:
                 trailing_ms = int(round(audio_duration * 1000 - current_time_ms))
                 final_audio += AudioSegment.silent(duration=trailing_ms)
 
-            # Export final WAV
+            # Export
             final_audio.export(str(out_filename), format="wav")
             self.log(f"Single TTS WAV saved to: {out_filename}")
+            self.log(f"   Voice quality: Natural (no speed modifications applied)")
             return out_filename
 
         finally:
@@ -487,7 +505,6 @@ class LocalAudioTranslator:
                 shutil.rmtree(tmpdir)
             except Exception:
                 pass
-
 
 
     def translate_with_google(self, text, target_lang):
@@ -516,10 +533,10 @@ class LocalAudioTranslator:
             return translated
         except Exception as e:
             raise RuntimeError(f"Google fallback failed: {e}")
-
+    
     def translate_with_ollama(self, transcript):
-        """Translate transcript using local Ollama with Google fallback if necessary."""
-        self.log("Step 3: Translating with local Llama model via Ollama...")
+        """Translate transcript using local Ollama with duration-aware translation for dubbing."""
+        self.log("Step 3: Translating with local Llama model via Ollama (dubbing-optimized)...")
         self.translation_file_path = self.dirs["translations"] / f"translations_{self.timestamp}.json"
 
         if self.existing_files["translation"] and self.existing_files["translation"].exists():
@@ -536,63 +553,73 @@ class LocalAudioTranslator:
         failed_batches = 0
         processed_words = 0
         processed_chars = 0
-        total_tokens_generated = 0
 
         with tqdm(total=len(segments), desc="🔄 Translating Segments", unit="seg",
-                  bar_format='{desc}: {percentage:3.0f}%|{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}]') as main_pbar:
+                bar_format='{desc}: {percentage:3.0f}%|{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}]') as main_pbar:
 
             for batch_idx in range(0, len(segments), batch_size):
                 batch = segments[batch_idx:batch_idx + batch_size]
                 current_batch = batch_idx // batch_size + 1
 
-                # Prepare prompt
+                # Prepare duration-aware prompt
                 segments_text = ""
                 for seg in batch:
-                    segments_text += f"[{seg['start']:.2f}s - {seg['end']:.2f}s] {seg['text']}\n"
+                    duration = seg['end'] - seg['start']
+                    word_count = len(seg['text'].split())
+                    segments_text += f"[{seg['start']:.2f}s - {seg['end']:.2f}s] (Duration: {duration:.1f}s, Words: {word_count}) {seg['text']}\n"
 
                 prompt = (
-                    f"You are a professional translator. Translate the following timestamped audio transcript segments "
+                    f"You are a professional dubbing translator for voice-over work. Translate these audio segments "
                     f"from {transcript.get('language', 'English')} to {self.target_language}.\n\n"
-                    "CRITICAL REQUIREMENTS:\n"
-                    "1. Translate naturally - maintain the same meaning and tone\n"
-                    "2. Keep translations concise to fit the same time duration\n"
-                    "3. Preserve technical terms appropriately\n"
-                    "4. Use natural phrasing\n"
-                    "5. Maintain emotional intensity and style\n\n"
-                    "Transcript segments:\n"
+                    "CRITICAL DUBBING RULES:\n"
+                    "1. **TIME CONSTRAINT**: Your translation MUST fit within the same duration as the original\n"
+                    "2. **Syllable matching**: Match the syllable count as closely as possible to the original\n"
+                    "3. **Natural speech**: Translation must sound natural when spoken at normal speed\n"
+                    "4. **Adjust word count**: Use shorter/longer synonyms, remove filler words, or rephrase to fit time\n"
+                    "5. **Meaning priority**: Preserve core meaning, but sacrifice literal accuracy for timing if needed\n"
+                    "6. **Speech rate**: Assume normal speech rate (~150 words/minute in Polish, ~140 in English)\n\n"
+                    "STRATEGY:\n"
+                    "- If original has 10 words in 5 seconds → aim for 10-12 words in Polish\n"
+                    "- For short segments (<3s): Keep it very concise, use contractions\n"
+                    "- For long segments (>10s): You have more flexibility\n"
+                    "- Remove unnecessary words: 'actually', 'basically', 'you know', etc.\n\n"
+                    "Original segments (with timing info):\n"
                     f"{segments_text}\n\n"
-                    "Return ONLY a JSON array with this exact structure (no other text):\n"
-                    "[\n  {\"start\": 0.00, \"end\": 5.50, \"original\": \"original text\", \"translated\": \"translated text\"},\n  ...\n]\n\nJSON array:"
-                )
+                    "Return ONLY a JSON array with time-optimized translations:\n"
+                    "[\n"
+                    '  {"start": 0.00, "end": 5.50, "original": "original text", "translated": "concise fitted translation"},\n'
+                    "  ...\n"
+                    "]\n\n"
+                    "REMEMBER: Shorter translations that fit naturally are better than accurate translations that sound rushed!\n\n"
+                    "JSON array:"
+            )
 
                 # Attempt Ollama call
                 success = False
                 try:
-                    # Call Ollama
                     payload = {
                         "model": OLLAMA_MODEL,
                         "prompt": prompt,
                         "stream": False,
                         "options": {
-                            "temperature": 0.3,
-                            "top_p": 0.9
+                            "temperature": 0.5,  # Slightly higher for more creative rephrasing
+                            "top_p": 0.9,
+                            "num_predict": 2048  # Allow longer responses for explanations
                         }
                     }
-                    api_desc = f"Batch {current_batch}/{total_batches} (segments {len(batch)})"
+                
                     with tqdm(total=100, desc=f"   └─ API Call", unit="%", leave=False) as api_pbar:
                         api_pbar.update(10)
                         resp = requests.post(OLLAMA_URL, json=payload, timeout=300)
                         api_pbar.update(40)
+                    
                         if resp.status_code == 200:
                             result = resp.json()
-                            # try to find text in typical places
                             response_text = None
+                        
                             if isinstance(result, dict):
-                                # Ollama sometimes returns {'response': '...'}
                                 response_text = result.get("response") or result.get("text") or result.get("result") or None
-                                # Some Ollama variants include 'output' or list -> join
                                 if response_text is None:
-                                    # Search nested
                                     for v in result.values():
                                         if isinstance(v, str) and "[" in v and "]" in v:
                                             response_text = v
@@ -603,9 +630,10 @@ class LocalAudioTranslator:
                             if not response_text:
                                 raise ValueError("Ollama response missing 'response' text")
 
-                            # Extract JSON array from response_text
+                            # Extract JSON array
                             json_start = response_text.find("[")
                             json_end = response_text.rfind("]") + 1
+                        
                             if json_start >= 0 and json_end > json_start:
                                 json_str = response_text[json_start:json_end]
                                 batch_translations = json.loads(json_str)
@@ -613,7 +641,6 @@ class LocalAudioTranslator:
                                 api_pbar.update(50)
                                 success = True
                             else:
-                                # Try parsing as direct JSON
                                 try:
                                     batch_translations = json.loads(response_text)
                                     if isinstance(batch_translations, list):
@@ -626,13 +653,14 @@ class LocalAudioTranslator:
                                     raise ValueError("No JSON array found in Ollama response")
                         else:
                             raise RuntimeError(f"Ollama API error: {resp.status_code} - {resp.text[:200]}")
+                        
                 except Exception as e:
                     failed_batches += 1
                     self.log(f"   ⚠ Ollama translation error in batch {current_batch}: {e}")
                     self.log("   → Trying Google fallback for this batch (if enabled)")
 
                 if not success:
-                    # Use Google fallback per segment if enabled
+                    # Google fallback (won't be duration-aware, but better than nothing)
                     if USE_GOOGLE_FALLBACK:
                         for seg in batch:
                             try:
@@ -645,7 +673,6 @@ class LocalAudioTranslator:
                                 })
                             except Exception as ge:
                                 self.log(f"     ⚠ Google fallback failed for segment starting at {seg['start']}: {ge}")
-                                # fallback to original text
                                 translated_segments.append({
                                     "start": seg["start"],
                                     "end": seg["end"],
@@ -653,7 +680,6 @@ class LocalAudioTranslator:
                                     "translated": seg["text"]
                                 })
                     else:
-                        # fallback to original
                         for seg in batch:
                             translated_segments.append({
                                 "start": seg["start"],
@@ -672,22 +698,24 @@ class LocalAudioTranslator:
                     'status': '✓' if success else '⚠'
                 })
 
-        total_elapsed = (datetime.now() - start_time).total_seconds()
-        avg_words_per_sec = processed_words / total_elapsed if total_elapsed > 0 else 0
-        success_rate = ((total_batches - failed_batches) / total_batches * 100) if total_batches > 0 else 0
-
         self.log(f"Translation complete: {len(translated_segments)} segments, {processed_words} words")
+    
         # Save translations
         with open(self.translation_file_path, "w", encoding="utf-8") as f:
             json.dump(translated_segments, f, indent=2, ensure_ascii=False)
 
-        # Save text-only version
+        # Save text with timing analysis
         text_file = self.dirs["translations"] / f"translations_text_{self.timestamp}.txt"
         with open(text_file, "w", encoding="utf-8") as f:
             for seg in translated_segments:
-                f.write(f"[{seg['start']:.2f}s - {seg['end']:.2f}s]\n")
-                f.write(f"Original:   {seg['original']}\n")
-                f.write(f"Translated: {seg['translated']}\n\n")
+                duration = seg['end'] - seg['start']
+                orig_words = len(seg['original'].split())
+                trans_words = len(seg['translated'].split())
+            
+                f.write(f"[{seg['start']:.2f}s - {seg['end']:.2f}s] (Duration: {duration:.1f}s)\n")
+                f.write(f"Original ({orig_words} words):   {seg['original']}\n")
+                f.write(f"Translated ({trans_words} words): {seg['translated']}\n")
+                f.write(f"Word ratio: {trans_words/orig_words:.2f}x\n\n")
 
         return translated_segments
 
@@ -708,264 +736,250 @@ class LocalAudioTranslator:
         # handle negative or None
         try:
             seconds = float(seconds)
-        except Exception:
+        except (TypeError, ValueError):
             seconds = 0.0
+        
+        if seconds < 0: seconds = 0.0
 
-        if seconds < 0:
-            seconds = 0.0
+        td = timedelta(seconds=seconds)
+        hours, remainder = divmod(td.seconds, 3600)
+        minutes, seconds_int = divmod(remainder, 60)
+        milliseconds = td.microseconds // 1000
 
-        hours = int(seconds // 3600)
-        minutes = int((seconds % 3600) // 60)
-        secs = int(seconds % 60)
-        millis = int(round((seconds - math.floor(seconds)) * 1000))
-
-        # handle rounding that produces 1000 milliseconds
-        if millis >= 1000:
-            millis -= 1000
-            secs += 1
-            if secs >= 60:
-                secs = 0
-                minutes += 1
-                if minutes >= 60:
-                    minutes = 0
-                    hours += 1
-
-        sep = ',' if format_type == 'srt' else '.'
-        return f"{hours:02}:{minutes:02}:{secs:02}{sep}{millis:03}"
-
-    def create_subtitles(self, translated_segments):
-        """Create SRT and VTT subtitle files and a bilingual SRT."""
-        self.log("Step 4: Creating subtitle files...")
+        if format_type == 'srt':
+            # SRT format: HH:MM:SS,mmm
+            return f"{hours:02}:{minutes:02}:{seconds_int:02},{milliseconds:03}"
+        elif format_type == 'vtt':
+            # VTT format: HH:MM:SS.mmm
+            return f"{hours:02}:{minutes:02}:{seconds_int:02}.{milliseconds:03}"
+        else:
+            raise ValueError("Invalid format_type")
+        
+    def generate_subtitles(self, original_segments, translated_segments):
+        """Step 4: Generate SRT and VTT subtitle files (translated and bilingual)"""
+        self.log("Step 4: Generating subtitle files (.srt, .vtt)...")
 
         self.srt_file_path = self.dirs["subtitles"] / f"subtitles_{self.timestamp}.srt"
         self.vtt_file_path = self.dirs["subtitles"] / f"subtitles_{self.timestamp}.vtt"
         self.bilingual_file_path = self.dirs["subtitles"] / f"subtitles_bilingual_{self.timestamp}.srt"
-
-        # SRT
-        with open(self.srt_file_path, "w", encoding="utf-8") as f_srt:
-            for i, segment in enumerate(translated_segments, start=1):
-                start_srt = self._format_timestamp(segment['start'], 'srt')
-                end_srt = self._format_timestamp(segment['end'], 'srt')
-                text = segment.get('translated', '')
-                f_srt.write(f"{i}\n{start_srt} --> {end_srt}\n{text}\n\n")
-
-        # VTT
-        with open(self.vtt_file_path, "w", encoding="utf-8") as f_vtt:
-            f_vtt.write("WEBVTT\n\n")
-            for i, segment in enumerate(translated_segments, start=1):
-                start_vtt = self._format_timestamp(segment['start'], 'vtt')
-                end_vtt = self._format_timestamp(segment['end'], 'vtt')
-                text = segment.get('translated', '')
-                # VTT does not require numeric index but we can keep it for clarity
-                f_vtt.write(f"{i}\n{start_vtt} --> {end_vtt}\n{text}\n\n")
-
-        # bilingual SRT (translation first, original italicized)
-        with open(self.bilingual_file_path, "w", encoding="utf-8") as f_bi:
-            for i, segment in enumerate(translated_segments, start=1):
-                start_srt = self._format_timestamp(segment['start'], 'srt')
-                end_srt = self._format_timestamp(segment['end'], 'srt')
-                original_text = segment.get('original', '')
-                translated_text = segment.get('translated', '')
-                f_bi.write(f"{i}\n{start_srt} --> {end_srt}\n{translated_text}\n<i>{original_text}</i>\n\n")
-
-        self.log(f"SRT file saved to: {self.srt_file_path}")
-        self.log(f"VTT file saved to: {self.vtt_file_path}")
-        self.log(f"Bilingual SRT saved to: {self.bilingual_file_path}")
-
-    def generate_report(self, audio_duration, transcript_data, translated_segments, total_start_time):
-        """Generate a final summary report"""
-        self.log("Step 6: Generating final report...")
-        self.report_file_path = self.dirs["root"] / f"translation_report_{self.timestamp}.txt"
-
-        total_elapsed = (datetime.now() - total_start_time).total_seconds()
-        rtf = total_elapsed / audio_duration if audio_duration > 0 else 0
-
-        num_segments = len(translated_segments)
-        num_words_original = sum(len(s.get('original', '').split()) for s in translated_segments)
-        num_words_translated = sum(len(s.get('translated', '').split()) for s in translated_segments)
-
-        report_content = f"""
-=================================================
-TRANSLATION REPORT
-=================================================
-Timestamp: {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
-Run ID:    {self.timestamp}
-Target:    {self.target_language}
-
-=================================================
-SUMMARY
-=================================================
-Input File:     {self.input_file}
-Audio Duration: {audio_duration:.2f}s ({audio_duration/60:.2f} min)
-Total Time:     {total_elapsed:.2f}s ({total_elapsed/60:.2f} min)
-Processing Speed: {rtf:.2f}x Real-Time Factor (lower is faster)
-
-=================================================
-AUDIO (Step 1)
-=================================================
-Extracted File: {self.audio_file_path.name if self.audio_file_path else 'N/A'}
-Format:         16kHz, Mono, PCM 16-bit
-
-=================================================
-TRANSCRIPTION (Step 2)
-=================================================
-Whisper Model:   {WHISPER_MODEL}
-Device:          {WHISPER_DEVICE} ({WHISPER_COMPUTE_TYPE})
-Detected Lang:   {transcript_data.get('language', 'N/A')} (Prob: {transcript_data.get('language_probability', 0):.1%})
-Segments:        {len(transcript_data.get('segments', []))}
-Original Words:  {num_words_original}
-
-=================================================
-TRANSLATION (Step 3)
-=================================================
-Ollama Model:     {OLLAMA_MODEL}
-Target Language:  {self.target_language}
-Segments:         {num_segments}
-Translated Words: {num_words_translated}
-
-=================================================
-TTS GENERATION (Step 5)
-=================================================
-TTS Model:       {COQUI_TTS_MODEL}
-Speaker Sample:  {COQUI_TTS_SPEAKER} (MUST BE A VALID PATH)
-Final TTS Audio: {self.final_tts_file.name if self.final_tts_file else 'N/A'}
-
-=================================================
-OUTPUT FILES
-=================================================
-Log File:       {self.log_file.name}
-Extracted Audio: {self.audio_file_path.name if self.audio_file_path else 'N/A'}
-Raw Transcript: {self.transcript_file_path.name if self.transcript_file_path else 'N/A'}
-Raw Translation: {self.translation_file_path.name if self.translation_file_path else 'N/A'}
-SRT Subtitles:  {self.srt_file_path.name if self.srt_file_path else 'N/A'}
-VTT Subtitles:  {self.vtt_file_path.name if self.vtt_file_path else 'N/A'}
-Bilingual SRT:  {self.bilingual_file_path.name if self.bilingual_file_path else 'N/A'}
-Report File:    {self.report_file_path.name}
-
-=================================================
-"""
-
-        with open(self.report_file_path, "w", encoding="utf-8") as f:
-            f.write(report_content)
-
-        self.log(f"Report saved to: {self.report_file_path}")
-
-    def run(self):
-        """Run the full translation pipeline"""
-        self.log(f"Starting full translation process for: {self.input_file}")
-        total_start_time = datetime.now()
-
-        try:
-            # Step 0: Check Ollama if available, but allow fallback behavior
-            ollama_ok = self.check_ollama_running() and self.check_ollama_model()
-            if not ollama_ok:
-                self.log("⚠ Ollama server/model unavailable. Will attempt Google fallback if enabled.")
-            else:
-                self.log("Ollama server and model confirmed.")
-
-            # Step 1: Extract Audio
-            audio_file = self.extract_audio()
-            if not audio_file:
-                self.log("Error: Audio extraction failed.")
-                return
-
-            # Get audio duration for report
-            try:
-                probe_cmd = ["ffprobe", "-v", "error", "-show_entries", "format=duration",
-                             "-of", "default=noprint_wrappers=1:nokey=1", str(audio_file)]
-                audio_duration = float(subprocess.check_output(probe_cmd).decode().strip())
-            except Exception:
-                audio_duration = 0.0
-
-            # Step 2: Transcribe
-            transcript_data = self.transcribe_with_local_whisper(audio_file)
-            if not transcript_data or not transcript_data.get('segments'):
-                self.log("Error: Transcription failed or produced no segments.")
-                return
-
-            # Step 3: Translate
-            # If Ollama is not OK, we still call translate_with_ollama because it contains fallback logic.
-            translated_segments = self.translate_with_ollama(transcript_data)
-            if not translated_segments:
-                self.log("Error: Translation failed.")
-                return
-
-            # Step 4: Create Subtitles
-            self.create_subtitles(translated_segments)
+        
+        # Merge data (ensure lengths match, although they should if done correctly)
+        min_len = min(len(original_segments), len(translated_segments))
+        merged_segments = []
+        for i in range(min_len):
+            original = original_segments[i]
+            translated = translated_segments[i]
             
-            # Step 5: Generate Polish TTS from Segments (uses JSON/segments, not SRT)
-            self.synthesize_tts_from_segments(translated_segments, audio_duration)
-            self.log(f"🎵 Final Polish audio file: {self.final_tts_file.resolve()}")
+            # Simple check for structure integrity
+            if 'start' in original and 'end' in original and 'translated' in translated:
+                merged_segments.append({
+                    "id": i + 1,
+                    "start": translated['start'],
+                    "end": translated['end'],
+                    "original": original['text'],
+                    "translated": translated['translated']
+                })
+        
+        if not merged_segments:
+            self.log("❌ Subtitle generation failed: No segments to merge.")
+            return
 
-            # Step 6: Generate Report
-            self.generate_report(audio_duration, transcript_data, translated_segments, total_start_time)
+        # Write Translated SRT and VTT
+        with open(self.srt_file_path, "w", encoding="utf-8") as srt_f, \
+             open(self.vtt_file_path, "w", encoding="utf-8") as vtt_f:
+            
+            # VTT Header
+            vtt_f.write("WEBVTT\n\n")
 
-            total_elapsed = (datetime.now() - total_start_time).total_seconds()
-            self.log(f"\n{'='*80}")
-            self.log(f"🎉 PROCESS FINISHED SUCCESSFULLY in {total_elapsed:.2f}s ({total_elapsed/60:.2f} min)")
-            self.log(f"Output files are in: {self.output_dir.resolve()}")
-            self.log(f"Report file: {self.report_file_path.resolve()}")
-            self.log(f"{'='*80}\n")
+            for seg in merged_segments:
+                srt_start = self._format_timestamp(seg['start'], 'srt')
+                srt_end = self._format_timestamp(seg['end'], 'srt')
+                vtt_start = self._format_timestamp(seg['start'], 'vtt')
+                vtt_end = self._format_timestamp(seg['end'], 'vtt')
+
+                # SRT
+                srt_f.write(f"{seg['id']}\n")
+                srt_f.write(f"{srt_start} --> {srt_end}\n")
+                srt_f.write(f"{seg['translated']}\n\n")
+
+                # VTT
+                vtt_f.write(f"{vtt_start} --> {vtt_end}\n")
+                vtt_f.write(f"{seg['translated']}\n\n")
+
+        self.log(f"Translated subtitles saved to: {self.srt_file_path} and {self.vtt_file_path}")
+
+        # Write Bilingual SRT
+        with open(self.bilingual_file_path, "w", encoding="utf-8") as bilin_f:
+            for seg in merged_segments:
+                srt_start = self._format_timestamp(seg['start'], 'srt')
+                srt_end = self._format_timestamp(seg['end'], 'srt')
+                
+                bilin_f.write(f"{seg['id']}\n")
+                bilin_f.write(f"{srt_start} --> {srt_end}\n")
+                bilin_f.write(f"Original: {seg['original']}\n")
+                bilin_f.write(f"Translated: {seg['translated']}\n\n")
+        
+        self.log(f"Bilingual subtitles saved to: {self.bilingual_file_path}")
+        
+    def copy_final_outputs(self):
+        """Copy the final SRT, VTT, and TTS WAV files to the dedicated output directory."""
+        self.log("Step 6: Copying final outputs to dedicated directory...")
+        
+        final_dir = self.dirs["final_output"]
+        copied_files = []
+        
+        # Files to copy (only the latest ones generated in this run)
+        files_to_check = [
+            self.srt_file_path,
+            self.vtt_file_path,
+            self.bilingual_file_path,
+            self.final_tts_file
+        ]
+        
+        for file_path in files_to_check:
+            if file_path and Path(file_path).exists():
+                try:
+                    dest_path = final_dir / file_path.name
+                    shutil.copy2(file_path, dest_path)
+                    copied_files.append(dest_path)
+                except Exception as e:
+                    self.log(f"❌ Error copying {file_path.name}: {e}")
+
+        self.log(f"Successfully copied {len(copied_files)} files to: {final_dir}")
+        for f in copied_files:
+            self.log(f"   └─ {f.name}")
+        
+    def generate_report(self):
+        """Generate a final summary report."""
+        self.log("Step 7: Generating final report...")
+        self.report_file_path = self.output_dir / f"translation_report_{self.timestamp}.txt"
+        
+        # Get duration for RTF calculation if available
+        duration_sec = 0.0
+        try:
+            if self.audio_file_path and self.audio_file_path.exists():
+                probe_cmd = ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1", str(self.audio_file_path)]
+                duration_sec = float(subprocess.check_output(probe_cmd).decode().strip())
+        except Exception:
+            duration_sec = 0.0
+
+        # Gather file paths
+        audio_filename = self.audio_file_path.name if self.audio_file_path else "N/A"
+        transcript_filename = self.transcript_file_path.name if self.transcript_file_path else "N/A"
+        translation_filename = self.translation_file_path.name if self.translation_file_path else "N/A"
+        srt_filename = self.srt_file_path.name if self.srt_file_path else "N/A"
+        vtt_filename = self.vtt_file_path.name if self.vtt_file_path else "N/A"
+        bilingual_filename = self.bilingual_file_path.name if self.bilingual_file_path else "N/A"
+        tts_filename = self.final_tts_file.name if self.final_tts_file else "N/A"
+        
+        # Read log for overall timing (simple approximation)
+        try:
+            start_time_log = None
+            end_time_log = None
+            with open(self.log_file, "r", encoding="utf-8") as f:
+                for line in f:
+                    if "initialized" in line:
+                        try:
+                            start_time_log = datetime.strptime(line.split(']')[0].strip('[')[:-3], "%Y-%m-%d %H:%M:%S")
+                        except ValueError:
+                            pass
+                    if "Finished translation pipeline" in line:
+                        try:
+                            end_time_log = datetime.strptime(line.split(']')[0].strip('[')[:-3], "%Y-%m-%d %H:%M:%S")
+                        except ValueError:
+                            pass
+            
+            total_time_seconds = (end_time_log - start_time_log).total_seconds() if start_time_log and end_time_log else 0
+            
+            rtf_overall = total_time_seconds / duration_sec if duration_sec > 0 and total_time_seconds > 0 else 0
+        except Exception:
+            total_time_seconds = 0
+            rtf_overall = 0
+            
+        
+        with open(self.report_file_path, "w", encoding="utf-8") as f:
+            f.write(f"--- Translation Report - {self.timestamp} ---\n\n")
+            f.write(f"Input File: {self.input_file.name}\n")
+            f.write(f"Target Language: {self.target_language}\n")
+            f.write(f"Output Directory: {self.output_dir.resolve()}\n")
+            f.write(f"Video Duration: {duration_sec:.2f} seconds\n")
+            f.write(f"Overall Processing Time: {total_time_seconds:.2f} seconds\n")
+            f.write(f"Real-Time Factor (RTF): {rtf_overall:.2f}x (Lower is better)\n\n")
+            
+            f.write("--- Generated Files ---\n")
+            f.write(f"Extracted Audio: {audio_filename}\n")
+            f.write(f"Raw Transcript (JSON): {transcript_filename}\n")
+            f.write(f"Translation Data (JSON): {translation_filename}\n")
+            f.write(f"Translated Subtitle (SRT): {srt_filename}\n")
+            f.write(f"Translated Subtitle (VTT): {vtt_filename}\n")
+            f.write(f"Bilingual Subtitle (SRT): {bilingual_filename}\n")
+            f.write(f"Final TTS Audio: {tts_filename}\n")
+            f.write(f"Full Log: {self.log_file.name}\n\n")
+            
+            f.write(f"Final Outputs Copied To: {self.dirs['final_output'].resolve()}\n")
+
+        self.log(f"Final report generated: {self.report_file_path}")
+        
+    def run_pipeline(self):
+        """Main method to run the entire translation pipeline."""
+        try:
+            # 1. Extract Audio from VIDEO_FILE
+            audio_file = self.extract_audio()
+
+            # 2. Transcribe
+            transcript_data = self.transcribe_with_local_whisper(audio_file)
+            original_segments = transcript_data.get("segments", [])
+            audio_duration = transcript_data.get("duration", 0.0)
+
+            # 3. Translate
+            translated_segments = self.translate_with_ollama(transcript_data)
+
+            # 4. Generate Subtitles
+            self.generate_subtitles(original_segments, translated_segments)
+
+            # 5. Generate TTS Audio
+            if COQUI_TTS_MODEL and COQUI_TTS_SPEAKER:
+                self.synthesize_tts_from_segments(translated_segments, audio_duration)
+            else:
+                self.log("⚠️ Skipping TTS generation: COQUI_TTS_MODEL or COQUI_TTS_SPEAKER not configured.")
+            
+            # 6. Copy final outputs
+            self.copy_final_outputs()
+
+            # 7. Generate Report
+            self.generate_report()
+
+            self.log("\n✅ Finished translation pipeline successfully!")
 
         except Exception as e:
-            self.log(f"\n{'='*80}")
-            self.log(f"❌ FATAL ERROR: An unexpected error occurred: {e}")
+            self.log(f"\n❌ Pipeline failed: {e}")
             self.log(traceback.format_exc())
-            self.log("="*80)
+            self.generate_report() # Generate report even on failure
 
-        finally:
-            if self.whisper_model:
-                self.log("Releasing Whisper model from memory...")
-                del self.whisper_model
-            if self.tts_engine:
-                 self.log("Releasing TTS model from memory...")
-                 del self.tts_engine
-            if WHISPER_DEVICE == "cuda" or (self.tts_engine and torch.cuda.is_available()):
-                torch.cuda.empty_cache()
-                self.log("GPU memory cleared.")
-
-
+# Main execution block
 if __name__ == "__main__":
-    # --- Dependency Checks ---
-    try:
-        subprocess.run(["ffmpeg", "-version"], check=True, text=True, stderr=subprocess.DEVNULL, stdout=subprocess.DEVNULL)
-    except (FileNotFoundError, subprocess.CalledProcessError):
-        print("="*80)
-        print("❌ ERROR: FFmpeg is not installed or not in your system's PATH.")
-        print("Please install FFmpeg to continue: https://ffmpeg.org/download.html")
-        print("="*80)
+    # Ensure VIDEO_FILE is defined in settings.py
+    if 'VIDEO_FILE' not in globals() or not VIDEO_FILE:
+        print("❌ Error: VIDEO_FILE not defined in settings.py.")
         exit(1)
-
-    try:
-        subprocess.run(["ffprobe", "-version"], check=True, text=True, stderr=subprocess.DEVNULL, stdout=subprocess.DEVNULL)
-    except (FileNotFoundError, subprocess.CalledProcessError):
-        print("="*80)
-        print("❌ ERROR: ffprobe (part of FFmpeg) is not installed or not in your system's PATH.")
-        print("Please install FFmpeg to continue: https://ffmpeg.org/download.html")
-        print("="*80)
+        
+    if 'OUTPUT_DIR' not in globals() or not OUTPUT_DIR:
+        print("❌ Error: OUTPUT_DIR not defined in settings.py.")
         exit(1)
-
-    if not Path(INPUT_AUDIO).exists():
-        print("="*80)
-        print(f"❌ ERROR: Input file not found: {INPUT_AUDIO}")
-        print("Please update the INPUT_AUDIO variable at the top of the script.")
-        print("="*80)
-        exit(1)
-
-    print(f"Starting translation for: {INPUT_AUDIO}")
-    print(f"Output will be saved to: {OUTPUT_DIR}")
-    print("="*80)
+    # Initialize and run the translator
+    translator = LocalAudioTranslator(
+        input_file=VIDEO_FILE, 
+        output_dir=OUTPUT_DIR, 
+        target_language=LANGUAGE
+    )
     
-    # --- TTS Speaker File Check ---
-    # COQUI_TTS_SPEAKER must be a path to a 5-10 second audio file of the original speaker
-    # to clone the voice.
-    if COQUI_TTS_MODEL.endswith('xtts_v2') and not Path(COQUI_TTS_SPEAKER).is_file():
-        print("="*80)
-        print(f"🛑 CRITICAL WARNING: Coqui XTTS model requires a speaker sample.")
-        print(f"Please change the COQUI_TTS_SPEAKER variable (currently: '{COQUI_TTS_SPEAKER}')")
-        print(f"to the **full path** of a 5-10 second WAV/MP3 file of the original speaker's voice.")
-        print("The script may fail at Step 5 if this is not corrected.")
-        print("="*80)
+    # Check dependencies before starting the whole process
+    try:
+        if not shutil.which("ffmpeg") or not shutil.which("ffprobe"):
+            print("❌ FFmpeg/FFprobe not found. Please install it and ensure it's in your PATH.")
+            exit(1)
+    except Exception as e:
+        print(f"❌ Error checking FFmpeg: {e}")
+        exit(1)
 
-    translator = LocalAudioTranslator(INPUT_AUDIO, OUTPUT_DIR, LANGUAGE)
-    translator.run()
+    translator.run_pipeline()
